@@ -9,11 +9,10 @@ import (
 
 type Poll struct {
 	fd int
-	// changes []unix.Kevent_t
 }
 
 func CreatePoll() (poll *Poll, err error) {
-	poll = &Poll{}
+	poll = new(Poll)
 	if poll.fd, err = unix.Kqueue(); err != nil {
 		poll = nil
 		err = os.NewSyscallError("create kqueue error:", err)

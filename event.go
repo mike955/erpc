@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	defaultName    = "erpc-event-loop"
+	defaultName    = "eventloop-rpc"
 	defaultLoopNum = runtime.NumCPU()
 	defaultNetWork = "tcp"
 	defaultAddr    = "0.0.0.0:9000"
@@ -28,22 +28,11 @@ type listener struct {
 	file *os.File
 }
 
-type loop struct {
-	idx     int
-	poll    *internal.Poll
-	packet  []byte
-	fdConns map[int]*conn
-	count   int32
-	// handler Hanlder
-}
+type Handler func(req []byte) (resp []byte)
 
-type conn struct {
-	idx   int
-	sa    unix.Sockaddr
-	fd    int
-	data  []byte
-	laddr net.Addr
-	radd  net.Addr
+var defaultHandler Handler = func(req []byte) (resp []byte) {
+	resp = req
+	return
 }
 
 type EventLoop struct {
@@ -52,9 +41,11 @@ type EventLoop struct {
 	network string
 	addr    string
 
-	lis   *listener
-	loops []*loop
-	codec Codec
+	lis     *listener
+	loops   []*loop
+	handler Handler
+	codec   Codec
+	lb      *balance
 
 	cond *sync.Cond
 	wg   *sync.WaitGroup
@@ -93,14 +84,21 @@ func Codecer(codec Codec) EventLoopOption {
 	}
 }
 
+func LoadBalance(balance BalanceType) EventLoopOption {
+	return func(e *EventLoop) {
+		e.lb = NewBalance(balance)
+	}
+}
+
 func NewServer(app string, opts ...EventLoopOption) (eventLoop *EventLoop) {
 	eventLoop = &EventLoop{
 		name:    defaultName,
 		network: defaultNetWork,
 		addr:    defaultAddr,
 		codec:   dc,
-
-		wg: &sync.WaitGroup{},
+		handler: defaultHandler,
+		wg:      &sync.WaitGroup{},
+		lb:      NewBalance(RoundRobin),
 	}
 	for _, o := range opts {
 		o(eventLoop)
@@ -108,15 +106,10 @@ func NewServer(app string, opts ...EventLoopOption) (eventLoop *EventLoop) {
 	return eventLoop
 }
 
-// func (e *EventLoop) RegisterService(err error) {
-// 	listener, err := net.Listen("tcp", e.addr)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	e.listener = listener
-// 	err = e.serve()
-// 	return
-// }
+func (e *EventLoop) RegisterHandler(handler Handler) {
+	e.handler = handler
+	return
+}
 
 func (e *EventLoop) Serve() (err error) {
 	lis, err := e.createListener()
@@ -162,10 +155,12 @@ func (e *EventLoop) createLoop() (err error) {
 			return err
 		}
 		l := &loop{
-			idx:     i,
+			idx:     int32(i),
 			poll:    pool,
 			packet:  make([]byte, 0xFFFF),
 			fdConns: make(map[int]*conn),
+			codec:   e.codec,
+			handler: e.handler,
 		}
 		l.poll.AddRead(e.lis.fd)
 		e.loops = append(e.loops, l)
@@ -202,10 +197,11 @@ func (e *EventLoop) serve() (err error) {
 			sa:    sa,
 			fd:    nfd,
 			laddr: e.lis.addr,
+			radd:  e.socketAddrToNetAdr(sa),
 		}
 		loop := e.selectLoop()
-		loop.poll.AddReadWrite(nfd)
-		loop.fdConns[nfd] = conn
+		loop.addFd(nfd, conn)
+		e.lb.addBalance(loop.idx, conn.fd)
 		return nil
 	})
 
@@ -213,50 +209,54 @@ func (e *EventLoop) serve() (err error) {
 }
 
 func (e *EventLoop) selectLoop() (loop *loop) {
-	loop = e.loops[0]
+	load := e.lb.next()
+	if e.loops[load] == nil {
+		panic("select loop error")
+	}
+	loop = e.loops[load]
 	return
 }
 
 func (e *EventLoop) loopRun(l *loop) {
 	defer func() {
-		//fmt.Println("-- loop stopped --", l.idx)
-		// s.signalShutdown()
 		e.wg.Done()
+		l.closeAllConns()
 	}()
 	l.poll.Wait(func(fd int, filter int16) (err error) {
-		// time.Sleep(time.Minute * 1)
 		if conn, exist := l.fdConns[fd]; exist {
 			switch filter {
-			case unix.EVFILT_READ:
-				l.loopRead(fd, conn)
-			case unix.EVFILT_WRITE:
-				l.loopWrite(fd, conn)
+			case unix.EVFILT_READ, unix.EVFILT_WRITE:
+				err = l.loopRead(fd)
+			}
+			if err != nil {
+				l.closeConn(conn.fd)
+				e.lb.removeBalance(l.idx, conn.fd)
 			}
 		}
 		return
 	})
 }
 
-func (l *loop) loopRead(fd int, c *conn) (err error) {
-	n, err := unix.Read(c.fd, l.packet)
-	if n == 0 || err != nil {
-		if err == syscall.EAGAIN {
-			return nil
+func (e *EventLoop) socketAddrToNetAdr(sa unix.Sockaddr) (addr net.Addr) {
+	switch sa := sa.(type) {
+	case *unix.SockaddrInet4:
+		addr = &net.TCPAddr{
+			IP:   sa.Addr[0:],
+			Port: sa.Port,
 		}
-		delete(l.fdConns, fd)
-		unix.Close(c.fd)
-		return nil
-	}
-	var in = l.packet[:n]
-	fmt.Println("in", string(in))
-	var out []byte
-	out = append(out[:0], in...)
-	if len(out) != 0 {
-		unix.Write(c.fd, out)
+	case *unix.SockaddrInet6:
+		v6Addr := &net.TCPAddr{
+			IP:   sa.Addr[0:],
+			Port: sa.Port,
+		}
+		if sa.ZoneId != 0 {
+			if ifi, err := net.InterfaceByIndex(int(sa.ZoneId)); err == nil {
+				v6Addr.Zone = ifi.Name
+			}
+		}
+		addr = v6Addr
+	case *unix.SockaddrUnix:
+		return &net.UnixAddr{Name: sa.Name, Net: "unix"}
 	}
 	return nil
-}
-
-func (l *loop) loopWrite(fd int, c *conn) {
-
 }
