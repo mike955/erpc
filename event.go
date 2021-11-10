@@ -13,10 +13,17 @@ import (
 )
 
 var (
-	defaultName    = "eventloop-rpc"
-	defaultLoopNum = runtime.NumCPU()
-	defaultNetWork = "tcp"
-	defaultAddr    = "0.0.0.0:9000"
+	defaultName       = "eventloop-rpc"
+	defaultLoopNum    = runtime.NumCPU()
+	defaultNetWork    = "tcp"
+	defaultAddr       = "127.0.0.1:9000"
+	defaultBufferSize = 0xFFFF
+	defaultPollSize   = 128
+
+	defaultCallback CallbackHandler = func(req []byte) (resp []byte) {
+		resp = req
+		return
+	}
 )
 
 type EventLoopOption func(e *EventLoop)
@@ -28,24 +35,20 @@ type listener struct {
 	file *os.File
 }
 
-type Handler func(req []byte) (resp []byte)
-
-var defaultHandler Handler = func(req []byte) (resp []byte) {
-	resp = req
-	return
-}
+type CallbackHandler func(req []byte) (resp []byte)
 
 type EventLoop struct {
-	name    string
-	numLoop int
-	network string
-	addr    string
+	name       string
+	numLoop    int
+	network    string
+	addr       string
+	bufferSize int
+	pollSize   int
 
-	lis     *listener
-	loops   []*loop
-	handler Handler
-	codec   Codec
-	lb      *balance
+	lis      *listener
+	loops    []*loop
+	callback CallbackHandler
+	lb       *balance
 
 	cond *sync.Cond
 	wg   *sync.WaitGroup
@@ -78,27 +81,34 @@ func Address(addr string) EventLoopOption {
 	}
 }
 
-func Codecer(codec Codec) EventLoopOption {
+func LoadBalance(balance BalanceType) EventLoopOption {
 	return func(e *EventLoop) {
-		e.codec = codec
+		e.lb = newBalance(balance)
 	}
 }
 
-func LoadBalance(balance BalanceType) EventLoopOption {
+func BufferSize(size int) EventLoopOption {
 	return func(e *EventLoop) {
-		e.lb = NewBalance(balance)
+		e.bufferSize = size
+	}
+}
+
+func PollSize(size int) EventLoopOption {
+	return func(e *EventLoop) {
+		e.pollSize = size
 	}
 }
 
 func NewServer(app string, opts ...EventLoopOption) (eventLoop *EventLoop) {
 	eventLoop = &EventLoop{
-		name:    defaultName,
-		network: defaultNetWork,
-		addr:    defaultAddr,
-		codec:   dc,
-		handler: defaultHandler,
-		wg:      &sync.WaitGroup{},
-		lb:      NewBalance(RoundRobin),
+		name:       defaultName,
+		network:    defaultNetWork,
+		addr:       defaultAddr,
+		bufferSize: defaultBufferSize,
+		pollSize:   defaultPollSize,
+		callback:   defaultCallback,
+		wg:         &sync.WaitGroup{},
+		lb:         newBalance(RoundRobin),
 	}
 	for _, o := range opts {
 		o(eventLoop)
@@ -106,22 +116,26 @@ func NewServer(app string, opts ...EventLoopOption) (eventLoop *EventLoop) {
 	return eventLoop
 }
 
-func (e *EventLoop) RegisterHandler(handler Handler) {
-	e.handler = handler
+func (e *EventLoop) RegisterCallback(callback CallbackHandler) {
+	e.callback = callback
 	return
 }
 
 func (e *EventLoop) Serve() (err error) {
 	lis, err := e.createListener()
 	if err != nil {
-		panic(err)
+		return err
 	}
 	e.lis = lis
 	err = e.createLoop()
 	if err != nil {
-		panic(err)
+		return err
 	}
 	err = e.serve()
+	return
+}
+
+func (e *EventLoop) Stop() (err error) {
 	return
 }
 
@@ -150,17 +164,16 @@ func (e *EventLoop) createListener() (lis *listener, err error) {
 
 func (e *EventLoop) createLoop() (err error) {
 	for i := 0; i < e.numLoop; i++ {
-		pool, err := internal.CreatePoll()
+		pool, err := internal.CreatePoll(e.pollSize)
 		if err != nil {
 			return err
 		}
 		l := &loop{
-			idx:     int32(i),
-			poll:    pool,
-			packet:  make([]byte, 0xFFFF),
-			fdConns: make(map[int]*conn),
-			codec:   e.codec,
-			handler: e.handler,
+			idx:      int32(i),
+			poll:     pool,
+			packet:   make([]byte, e.bufferSize),
+			fdConns:  make(map[int]*conn),
+			callback: e.callback,
 		}
 		l.poll.AddRead(e.lis.fd)
 		e.loops = append(e.loops, l)
@@ -171,40 +184,44 @@ func (e *EventLoop) createLoop() (err error) {
 func (e *EventLoop) serve() (err error) {
 	e.wg.Add(len(e.loops))
 	for _, l := range e.loops {
-		go e.loopRun(l)
+		go e.runLoop(l)
 	}
 
-	mainPoll, err := internal.CreatePoll()
+	mainPoll, err := internal.CreatePoll(e.pollSize)
 	if err != nil {
 		return
 	}
 	if err = mainPoll.AddRead(e.lis.fd); err != nil {
 		return
 	}
-	mainPoll.Wait(func(fd int, filter int16) (err error) {
-		nfd, sa, err := unix.Accept(fd)
-		if err != nil {
-			if err == syscall.EAGAIN {
-				return nil
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		err = mainPoll.Wait(func(fd int, filter int16) (err error) {
+			nfd, sa, err := unix.Accept(fd)
+			if err != nil {
+				if err == syscall.EAGAIN {
+					return nil
+				}
+				return err
 			}
-			return err
-		}
-		if err = unix.SetNonblock(nfd, true); err != nil {
-			err = os.NewSyscallError("set fs not block error: ", err)
+			if err = unix.SetNonblock(nfd, true); err != nil {
+				err = os.NewSyscallError("set fs not block error: ", err)
+				return
+			}
+			conn := &conn{
+				sa:    sa,
+				fd:    nfd,
+				laddr: e.lis.addr,
+				radd:  e.socketAddrToNetAdr(sa),
+			}
+			loop := e.selectLoop()
+			loop.addFd(nfd, conn)
+			e.lb.addBalance(loop.idx, conn.fd)
 			return
-		}
-		conn := &conn{
-			sa:    sa,
-			fd:    nfd,
-			laddr: e.lis.addr,
-			radd:  e.socketAddrToNetAdr(sa),
-		}
-		loop := e.selectLoop()
-		loop.addFd(nfd, conn)
-		e.lb.addBalance(loop.idx, conn.fd)
-		return nil
-	})
-
+		})
+	}()
+	e.wg.Wait()
 	return
 }
 
@@ -217,7 +234,7 @@ func (e *EventLoop) selectLoop() (loop *loop) {
 	return
 }
 
-func (e *EventLoop) loopRun(l *loop) {
+func (e *EventLoop) runLoop(l *loop) {
 	defer func() {
 		e.wg.Done()
 		l.closeAllConns()

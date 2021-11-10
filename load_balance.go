@@ -20,7 +20,7 @@ type balance struct {
 	balanceSize    int32
 }
 
-func NewBalance(b BalanceType) (bl *balance) {
+func newBalance(b BalanceType) (bl *balance) {
 	bl = &balance{
 		bl:             b,
 		loadBalanceMap: map[int32][]int{},

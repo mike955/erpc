@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"errors"
 	"os"
 	"syscall"
 
@@ -8,11 +9,13 @@ import (
 )
 
 type Poll struct {
-	fd int
+	fd       int
+	pollSize int
 }
 
-func CreatePoll() (poll *Poll, err error) {
+func CreatePoll(pollSize int) (poll *Poll, err error) {
 	poll = new(Poll)
+	poll.pollSize = pollSize
 	if poll.fd, err = unix.Kqueue(); err != nil {
 		poll = nil
 		err = os.NewSyscallError("create kqueue error:", err)
@@ -77,8 +80,8 @@ func (p *Poll) ModReadWrite(fd int) (err error) {
 	return
 }
 
-func (p *Poll) Wait(callback func(fd int, filter int16) error) error {
-	events := make([]unix.Kevent_t, 128)
+func (p *Poll) Wait(callback func(fd int, filter int16) error) (err error) {
+	events := make([]unix.Kevent_t, p.pollSize)
 	var tsp *unix.Timespec
 	for {
 		n, err := unix.Kevent(p.fd, nil, events, tsp)
@@ -88,27 +91,18 @@ func (p *Poll) Wait(callback func(fd int, filter int16) error) error {
 			}
 		}
 		for i := 0; i < n; i++ {
-			event := events[i]
+			event := &events[i]
 			if fd := int(event.Ident); fd != 0 {
 				efilter := event.Filter
-				// eflags := event.Flags
 				if (event.Flags&unix.EV_EOF != 0) || (event.Flags&unix.EV_ERROR != 0) {
 					efilter = -0xd
 				}
-				callback(fd, efilter)
-				// switch {
-				// 	case efilter = unix.con
-				// case efilter == unix.EVFILT_READ && eflags&unix.EV_ENABLE != 0:
-				// 	callback(fd, efilter)
-				// case efilter == unix.EVFILT_WRITE && eflags&unix.EV_ENABLE != 0:
-				// 	callback(fd, efilter)
-				// }
-				// switch err = callback(fd, efilter); err {
-				// case nil:
-				// case errors.New(""):
-				// default:
-				// 	fmt.Println("event loop error")
-				// }
+				err = callback(fd, efilter)
+				switch err {
+				case nil:
+				case errors.New(""):
+					return err
+				}
 			}
 		}
 	}

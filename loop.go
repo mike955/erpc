@@ -18,12 +18,11 @@ type conn struct {
 }
 
 type loop struct {
-	idx     int32
-	poll    *internal.Poll
-	packet  []byte
-	fdConns map[int]*conn
-	handler Handler
-	codec   Codec
+	idx      int32
+	poll     *internal.Poll
+	packet   []byte
+	fdConns  map[int]*conn
+	callback CallbackHandler
 }
 
 func (l *loop) loopRead(fd int) (err error) {
@@ -36,7 +35,7 @@ func (l *loop) loopRead(fd int) (err error) {
 		return err
 	}
 	var in = l.packet[:n]
-	resp := l.handler(in)
+	resp := l.callback(in)
 	if len(resp) != 0 {
 		unix.Write(conn.fd, resp)
 	}
