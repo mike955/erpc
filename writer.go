@@ -21,12 +21,10 @@ func newWriter(w io.Writer, headSize int) (wr *writer) {
 }
 
 func (w *writer) writePacket(packet []byte) (n int, err error) {
-	// 将数据包大小写入头部
 	n, err = w.writeHead(len(packet))
 	if err != nil {
 		return 0, err
 	}
-	// 发送数据包
 	return w.writeBody(packet)
 }
 
